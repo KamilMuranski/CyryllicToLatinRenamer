@@ -227,7 +227,10 @@ namespace CyryllicToLatinRenamer
                 ['і'] = "i",
                 ['ї'] = "yi",
                 ['є'] = "ye",
-                ['ґ'] = "g"
+                ['ґ'] = "g",
+                // białoruskie
+                ['Ў'] = "U",
+                ['ў'] = "u"
             };
 
             var sb = new StringBuilder(input.Length * 2);
