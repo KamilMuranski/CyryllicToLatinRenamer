@@ -19,26 +19,34 @@ namespace CyryllicToLatinRenamer
             Console.OutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
             Console.InputEncoding = Encoding.UTF8;
 
-            // EXE stoi na poziomie folderów gatunków
+            // EXE stoi NA GÓRZE struktury (u Ciebie: ...\bin\Debug\net9.0)
             string root = AppDomain.CurrentDomain.BaseDirectory;
 
             try
             {
-                foreach (var genreDir in Directory.GetDirectories(root, "*", SearchOption.TopDirectoryOnly))
-                    foreach (var bandDir in Directory.GetDirectories(genreDir, "*", SearchOption.TopDirectoryOnly))
-                        foreach (var albumDir in Directory.GetDirectories(bandDir, "*", SearchOption.TopDirectoryOnly))
-                        {
-                            // 1) Zmień nazwę folderu albumu
-                            string currentAlbumPath = RenameAlbumFolder(albumDir);
+                // Szukamy wszystkich katalogów, które wyglądają na albumy "YYYY - Tytuł"
+                var albumDirs = Directory.GetDirectories(root, "*", SearchOption.AllDirectories)
+                                         .Where(d => AlbumPattern.IsMatch(Path.GetFileName(d)))
+                                         .ToList();
 
-                            // 2) Zmień nazwy wszystkich plików wewnątrz albumu (rekurencyjnie), ale nie folderów
-                            RenameFiles(currentAlbumPath);
-                        }
+                Console.WriteLine($"Znaleziono {albumDirs.Count} katalogów albumów.");
+
+                foreach (var albumDir in albumDirs)
+                {
+                    // 1) Zmień nazwę folderu albumu (jeśli trzeba)
+                    string currentAlbumPath = RenameAlbumFolder(albumDir);
+
+                    // 2) Zmień nazwy wszystkich plików wewnątrz albumu (rekurencyjnie), ale nie folderów
+                    RenameFiles(currentAlbumPath);
+                }
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"Błąd ogólny: {ex.Message}");
             }
+
+            Console.WriteLine("Gotowe. Naciśnij klawisz...");
+            Console.ReadKey();
         }
 
         static string RenameAlbumFolder(string albumDir)
@@ -66,6 +74,7 @@ namespace CyryllicToLatinRenamer
                 try
                 {
                     Directory.Move(albumDir, newPath);
+                    Console.WriteLine($"[ALBUM] {folderName} -> {newName}");
                     return newPath;
                 }
                 catch (Exception ex)
@@ -103,14 +112,25 @@ namespace CyryllicToLatinRenamer
                 string newFileName = fileName; // domyślnie bez zmian
 
                 var t = TrackPattern.Match(nameNoExt);
-                if (t.Success)        // 03 - Tytuł
+                if (t.Success)        // NN - Tytuł
                 {
                     string nn = t.Groups[1].Value;
-                    string titleCyr = t.Groups[2].Value;
-                    string titleLat = TransliterateCyrillic(titleCyr);
+                    string rawTitle = t.Groups[2].Value;
 
-                    if (!string.Equals(titleLat, titleCyr, StringComparison.Ordinal))
-                        newFileName = $"{nn} - {titleLat} ({titleCyr}){ext}";
+                    // Najpierw spróbuj specjalnej logiki dla "cover"
+                    string? special = BuildCoverTitle(nn, rawTitle);
+                    if (special != null)
+                    {
+                        newFileName = special + ext;
+                    }
+                    else
+                    {
+                        string titleCyr = rawTitle;
+                        string titleLat = TransliterateCyrillic(titleCyr);
+
+                        if (!string.Equals(titleLat, titleCyr, StringComparison.Ordinal))
+                            newFileName = $"{nn} - {titleLat} ({titleCyr}){ext}";
+                    }
                 }
                 else                   // okładki/obrazy i inne pliki
                 {
@@ -127,6 +147,7 @@ namespace CyryllicToLatinRenamer
                     try
                     {
                         File.Move(path, newPath);
+                        Console.WriteLine($"[FILE] {fileName} -> {newFileName}");
                     }
                     catch (Exception ex)
                     {
@@ -140,6 +161,135 @@ namespace CyryllicToLatinRenamer
         {
             string ext = Path.GetExtension(path).ToLowerInvariant();
             return ext == ".mp3" || ext == ".jpg" || ext == ".jpeg" || ext == ".png";
+        }
+
+        /// <summary>
+        /// Czy ciąg zawiera jakikolwiek znak cyrylicy.
+        /// </summary>
+        static bool HasCyrillic(string input) =>
+            !string.IsNullOrEmpty(input) && Regex.IsMatch(input, @"\p{IsCyrillic}");
+
+        /// <summary>
+        /// Wyciąga zawartość nawiasów najwyższego poziomu oraz tekst przed pierwszym nawiasem.
+        /// Np. "A (B) (C(D))" → before="A", list: ["B", "C(D)"]
+        /// </summary>
+        static List<string> ExtractTopLevelParentheses(string input, out string beforeParentheses)
+        {
+            var result = new List<string>();
+            var outside = new StringBuilder();
+            var current = new StringBuilder();
+            int depth = 0;
+            beforeParentheses = string.Empty;
+
+            foreach (char ch in input)
+            {
+                if (ch == '(')
+                {
+                    if (depth == 0)
+                    {
+                        beforeParentheses = outside.ToString().TrimEnd();
+                        current.Clear();
+                    }
+                    depth++;
+                    if (depth == 1)
+                        continue; // nie dodajemy '(' do zawartości
+                }
+                else if (ch == ')')
+                {
+                    if (depth == 1)
+                    {
+                        result.Add(current.ToString().Trim());
+                        depth--;
+                        current.Clear();
+                        continue; // nie dodajemy ')'
+                    }
+                    if (depth > 1)
+                    {
+                        depth--;
+                        continue;
+                    }
+                }
+
+                if (depth == 0)
+                    outside.Append(ch);
+                else
+                    current.Append(ch);
+            }
+
+            if (string.IsNullOrEmpty(beforeParentheses))
+                beforeParentheses = outside.ToString().TrimEnd();
+
+            return result;
+        }
+
+        /// <summary>
+        /// Specjalne budowanie tytułów z "cover".
+        /// Zwraca nową nazwę bez rozszerzenia albo null, jeśli nie rozpoznano wzorca.
+        /// </summary>
+        static string? BuildCoverTitle(string trackNumber, string rawTitle)
+        {
+            if (string.IsNullOrWhiteSpace(rawTitle))
+                return null;
+
+            if (!rawTitle.Contains("cover", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            // Rozbij tytuł na część przed nawiasami i nawiasy najwyższego poziomu
+            string before;
+            var groups = ExtractTopLevelParentheses(rawTitle, out before);
+
+            if (groups.Count == 0)
+                return null;
+
+            // Znajdź tekst covera – pierwszy nawias zawierający "cover"
+            string? coverText = groups.FirstOrDefault(g =>
+                g.IndexOf("cover", StringComparison.OrdinalIgnoreCase) >= 0);
+
+            // Znajdź tytuł cyrylicą: albo część przed nawiasami, albo któryś nawias
+            string? cyrTitleRaw = null;
+            if (HasCyrillic(before))
+                cyrTitleRaw = before.Trim();
+            else
+                cyrTitleRaw = groups.FirstOrDefault(HasCyrillic);
+
+            if (cyrTitleRaw == null || coverText == null)
+                return null;
+
+            // Jeśli tytuł cyrylicą sam ma na końcu "(coś cover)" – odetnij to z tytułu
+            string cyrTitleBase = cyrTitleRaw;
+            var innerMatch = Regex.Match(
+                cyrTitleBase,
+                @"^(?<base>.*?)(\s*\((?<innerCover>[^()]*cover[^()]*)\))\s*$",
+                RegexOptions.IgnoreCase);
+            if (innerMatch.Success)
+            {
+                cyrTitleBase = innerMatch.Groups["base"].Value.TrimEnd();
+                var innerCover = innerMatch.Groups["innerCover"].Value.Trim();
+
+                // jeśli z zewnątrz nie mieliśmy coverText, użyj tego z wnętrza
+                if (string.IsNullOrEmpty(coverText))
+                    coverText = innerCover;
+            }
+
+            string titleLat = TransliterateCyrillic(cyrTitleBase);
+
+            // jeśli transliteracja nic nie zmienia – nie ma sensu tu nic kombinować
+            if (string.Equals(titleLat, cyrTitleBase, StringComparison.Ordinal))
+                return null;
+
+            bool coverHasCyr = HasCyrillic(coverText);
+
+            if (!coverHasCyr)
+            {
+                // NN - TytułŁacinką (TytułCyrylicą) (Nazwa cover)
+                return $"{trackNumber} - {titleLat} ({cyrTitleBase}) ({coverText})";
+            }
+            else
+            {
+                string coverLat = TransliterateCyrillic(coverText);
+                // NN - TytułŁacinką (ZespółŁacinką cover) (TytułCyrylicą (ZespółCyrylicą cover))
+                return $"{trackNumber} - {titleLat} ({coverLat}) ({cyrTitleBase} ({coverText}))";
+            }
         }
 
         /// <summary>
